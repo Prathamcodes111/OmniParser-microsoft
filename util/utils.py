@@ -18,17 +18,55 @@ import numpy as np
 # %matplotlib inline
 from matplotlib import pyplot as plt
 import easyocr
-from paddleocr import PaddleOCR
-reader = easyocr.Reader(['en'])
-paddle_ocr = PaddleOCR(
-    lang='en',  # other lang also available
-    use_angle_cls=False,
-    use_gpu=False,  # using cuda will conflict with pytorch in the same process
-    show_log=False,
-    max_batch_size=1024,
-    use_dilation=True,  # improves accuracy
-    det_db_score_mode='slow',  # improves accuracy
-    rec_batch_num=1024)
+
+reader = easyocr.Reader(["en"])
+
+# PaddleOCR is optional (OmniParser defaults to EasyOCR). Importing/constructing Paddle at module
+# load SIGSEGVs in Docker on some CPUs (Paddle 3 PIR / PreparePirProgram). We lazy-init only when
+# check_ocr_box(..., use_paddleocr=True).
+paddle_ocr = None
+
+
+def _lazy_init_paddle_ocr():
+    global paddle_ocr
+    if paddle_ocr is not None:
+        return paddle_ocr
+    # Prefer legacy inference path; PIR can crash in AnalysisPredictor on ARM/Docker.
+    if os.getenv("FLAGS_enable_pir_api") is None:
+        os.environ["FLAGS_enable_pir_api"] = "0"
+    try:
+        from paddleocr import PaddleOCR
+    except ImportError as e:
+        raise RuntimeError(
+            "paddleocr is not installed (e.g. API Docker image omits Paddle). "
+            "Use EasyOCR (default) or install paddlepaddle + paddleocr."
+        ) from e
+
+    # PaddleOCR 3.x + PaddleX: skip doc-orientation / unwarping (optional crash vectors).
+    _PADDLE_OCR_SAFE = {
+        "use_doc_orientation_classify": False,
+        "use_doc_unwarping": False,
+        "use_textline_orientation": False,
+    }
+    _paddle_candidates = [
+        {
+            **_PADDLE_OCR_SAFE,
+            "lang": "en",
+            "use_angle_cls": False,
+            "use_gpu": False,
+            "show_log": False,
+        },
+        {**_PADDLE_OCR_SAFE, "lang": "en", "show_log": False},
+        {**_PADDLE_OCR_SAFE, "lang": "en"},
+        dict(_PADDLE_OCR_SAFE),
+    ]
+    for _kwargs in _paddle_candidates:
+        try:
+            paddle_ocr = PaddleOCR(**_kwargs)
+            return paddle_ocr
+        except Exception:
+            continue
+    raise RuntimeError("Failed to initialize PaddleOCR with supported argument combinations.")
 import time
 import base64
 
@@ -61,10 +99,19 @@ def get_caption_model_processor(model_name, model_name_or_path="Salesforce/blip2
     elif model_name == "florence2":
         from transformers import AutoProcessor, AutoModelForCausalLM 
         processor = AutoProcessor.from_pretrained("microsoft/Florence-2-base", trust_remote_code=True)
-        if device == 'cpu':
-            model = AutoModelForCausalLM.from_pretrained(model_name_or_path, torch_dtype=torch.float32, trust_remote_code=True)
+        # Avoid SDPA path: newer transformers probe _supports_sdpa during load; hub Florence-2 lacks it.
+        _fl_kw = {"trust_remote_code": True, "attn_implementation": "eager"}
+        if device == "cpu":
+            _fl_kw["torch_dtype"] = torch.float32
         else:
-            model = AutoModelForCausalLM.from_pretrained(model_name_or_path, torch_dtype=torch.float16, trust_remote_code=True).to(device)
+            _fl_kw["torch_dtype"] = torch.float16
+        try:
+            model = AutoModelForCausalLM.from_pretrained(model_name_or_path, **_fl_kw)
+        except TypeError:
+            _fl_kw.pop("attn_implementation", None)
+            model = AutoModelForCausalLM.from_pretrained(model_name_or_path, **_fl_kw)
+        if not hasattr(model, "_supports_sdpa"):
+            model._supports_sdpa = False
     return {'model': model.to(device), 'processor': processor}
 
 
@@ -514,7 +561,8 @@ def check_ocr_box(image_source: Union[str, Image.Image], display_img = True, out
             text_threshold = 0.5
         else:
             text_threshold = easyocr_args['text_threshold']
-        result = paddle_ocr.ocr(image_np, cls=False)[0]
+        po = _lazy_init_paddle_ocr()
+        result = po.ocr(image_np, cls=False)[0]
         coord = [item[0] for item in result if item[1][1] > text_threshold]
         text = [item[1][0] for item in result if item[1][1] > text_threshold]
     else:  # EasyOCR
